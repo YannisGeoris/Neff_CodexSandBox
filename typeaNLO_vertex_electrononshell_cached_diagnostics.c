@@ -22,14 +22,14 @@ using namespace std;
 #define NCOMP 1
 #define NVEC 1
 #define EPSREL 1e-1 //5e-2 is the default one
-#define EPSRELGSL 1e-1 //5e-2
+#define EPSRELGSL 1e-3 // inner quadrature must be substantially tighter than Cuhre
 // The raw Cuhre integral is normally O(1). This absolute floor prevents a
 // cancellation-dominated channel from demanding an unattainable relative error.
 #define EPSABS 1e-6
 #define VERBOSE 0
 #define LAST 4
 #define MINEVAL 0
-#define MAXEVAL 200000 // diagnostic cap; raise only after inspecting convergence
+#define DEFAULT_MAXEVAL 200000
 #define GSL_LIMIT 5000 // convergence-test this in the range 1000--10000
 //#define LIMIT 1e8 // not sure needed here
 
@@ -1176,15 +1176,15 @@ static int integrand2to2p3_changevariable(const int *ndim, const double xx[], co
 }
 
 
-double GammaPp3(double m1, double m2, double m3, double q, double T, double gL, double gR, double lambda){
+double GammaPp3(double m1, double m2, double m3, double q, double T, double gL, double gR, double lambda, int maxeval){
     int nregions, neval, fail;
     double integral[NCOMP], error[NCOMP], prob[NCOMP];
     double args[8] = {m1,m2,m3,q,T,gL,gR,lambda};
     K_cached(T);
     auto start = chrono::steady_clock::now();
-    Cuhre(NDIM, NCOMP, integrand2to2p3_changevariable, args, NVEC, EPSREL, EPSABS, VERBOSE | LAST, MINEVAL, MAXEVAL, KEY, STATEFILE, SPIN, &nregions, &neval, &fail, integral, error, prob);
+    Cuhre(NDIM, NCOMP, integrand2to2p3_changevariable, args, NVEC, EPSREL, EPSABS, VERBOSE | LAST, MINEVAL, maxeval, KEY, STATEFILE, SPIN, &nregions, &neval, &fail, integral, error, prob);
     double seconds = chrono::duration<double>(chrono::steady_clock::now()-start).count();
-    printf("CUHRE p3: nregions=%d neval=%d fail=%d value=% .9e error=%.3e prob=%.3e elapsed=%.3fs eval/s=%.1f epsrel=%.1e epsabs=%.1e maxeval=%d\n", nregions, neval, fail, integral[0], error[0], prob[0], seconds, seconds > 0.0 ? neval/seconds : 0.0, EPSREL, EPSABS, MAXEVAL);
+    printf("CUHRE p3: nregions=%d neval=%d fail=%d value=% .9e error=%.3e prob=%.3e elapsed=%.3fs eval/s=%.1f epsrel=%.1e epsrel_gsl=%.1e epsabs=%.1e maxeval=%d\n", nregions, neval, fail, integral[0], error[0], prob[0], seconds, seconds > 0.0 ? neval/seconds : 0.0, EPSREL, EPSRELGSL, EPSABS, maxeval);
     return -8.0*pow2(GF)*e2*(1.0+exp(-q/T))/q*integral[0]/pow3(2*M_PI);
 }
 
@@ -1288,15 +1288,15 @@ static int integrand2to2p2_changevariable(const int *ndim, const double xx[], co
     return 0;
 }
 
-double GammaPp2(double m1, double m2, double m3, double q, double T, double gL, double gR, double lambda){
+double GammaPp2(double m1, double m2, double m3, double q, double T, double gL, double gR, double lambda, int maxeval){
     int nregions, neval, fail;
     double integral[NCOMP], error[NCOMP], prob[NCOMP];
     double args[8] = {m1,m2,m3,q,T,gL,gR,lambda};
     K_cached(T);
     auto start = chrono::steady_clock::now();
-    Cuhre(NDIM, NCOMP, integrand2to2p2_changevariable, args, NVEC, EPSREL, EPSABS, VERBOSE | LAST, MINEVAL, MAXEVAL, KEY, STATEFILE, SPIN, &nregions, &neval, &fail, integral, error, prob);
+    Cuhre(NDIM, NCOMP, integrand2to2p2_changevariable, args, NVEC, EPSREL, EPSABS, VERBOSE | LAST, MINEVAL, maxeval, KEY, STATEFILE, SPIN, &nregions, &neval, &fail, integral, error, prob);
     double seconds = chrono::duration<double>(chrono::steady_clock::now()-start).count();
-    printf("CUHRE p2: nregions=%d neval=%d fail=%d value=% .9e error=%.3e prob=%.3e elapsed=%.3fs eval/s=%.1f epsrel=%.1e epsabs=%.1e maxeval=%d\n", nregions, neval, fail, integral[0], error[0], prob[0], seconds, seconds > 0.0 ? neval/seconds : 0.0, EPSREL, EPSABS, MAXEVAL);
+    printf("CUHRE p2: nregions=%d neval=%d fail=%d value=% .9e error=%.3e prob=%.3e elapsed=%.3fs eval/s=%.1f epsrel=%.1e epsrel_gsl=%.1e epsabs=%.1e maxeval=%d\n", nregions, neval, fail, integral[0], error[0], prob[0], seconds, seconds > 0.0 ? neval/seconds : 0.0, EPSREL, EPSRELGSL, EPSABS, maxeval);
     return -8.0*pow2(GF)*e2*(1.0+exp(-q/T))/q*integral[0]/pow3(2*M_PI);
 }
 
@@ -1412,15 +1412,15 @@ static int integrand2to2p1_changevariable(const int *ndim, const double xx[], co
     return 0;
 }
 
-double GammaPp1(double m1, double m2, double m3, double q, double T, double gL, double gR, double lambda){
+double GammaPp1(double m1, double m2, double m3, double q, double T, double gL, double gR, double lambda, int maxeval){
     int nregions, neval, fail;
     double integral[NCOMP], error[NCOMP], prob[NCOMP];
     double args[8] = {m1,m2,m3,q,T,gL,gR,lambda};
     K_cached(T);
     auto start = chrono::steady_clock::now();
-    Cuhre(NDIM, NCOMP, integrand2to2p1_changevariable, args, NVEC, EPSREL, EPSABS, VERBOSE | LAST, MINEVAL, MAXEVAL, KEY, STATEFILE, SPIN, &nregions, &neval, &fail, integral, error, prob);
+    Cuhre(NDIM, NCOMP, integrand2to2p1_changevariable, args, NVEC, EPSREL, EPSABS, VERBOSE | LAST, MINEVAL, maxeval, KEY, STATEFILE, SPIN, &nregions, &neval, &fail, integral, error, prob);
     double seconds = chrono::duration<double>(chrono::steady_clock::now()-start).count();
-    printf("CUHRE p1: nregions=%d neval=%d fail=%d value=% .9e error=%.3e prob=%.3e elapsed=%.3fs eval/s=%.1f epsrel=%.1e epsabs=%.1e maxeval=%d\n", nregions, neval, fail, integral[0], error[0], prob[0], seconds, seconds > 0.0 ? neval/seconds : 0.0, EPSREL, EPSABS, MAXEVAL);
+    printf("CUHRE p1: nregions=%d neval=%d fail=%d value=% .9e error=%.3e prob=%.3e elapsed=%.3fs eval/s=%.1f epsrel=%.1e epsrel_gsl=%.1e epsabs=%.1e maxeval=%d\n", nregions, neval, fail, integral[0], error[0], prob[0], seconds, seconds > 0.0 ? neval/seconds : 0.0, EPSREL, EPSRELGSL, EPSABS, maxeval);
     return -8.0*pow2(GF)*e2*(1.0+exp(-q/T))/q*integral[0]/pow3(2*M_PI);
 }
 
@@ -1451,6 +1451,16 @@ static void validate_fixed_points(double q, double T, double gL, double gR, doub
     validate_fixed_point("p1", integrand2to2p1, q, T, gL, gR, lambda);
 }
 
+static void run_channels(double q, double T, double gL, double gR,
+                         double lambda, int maxeval){
+    printf("\n===== CONVERGENCE RUN maxeval=%d =====\n", maxeval);
+    double Gamma3 = GammaPp3(m_e, m_e, 0.0, q, T, gL, gR, lambda, maxeval);
+    double Gamma2 = GammaPp2(m_e, m_e, 0.0, q, T, gL, gR, lambda, maxeval);
+    double Gamma1 = GammaPp1(m_e, m_e, 0.0, q, T, gL, gR, lambda, maxeval);
+    printf("RATES maxeval=%d p3=% .9e p2=% .9e p1=% .9e total=% .9e\n",
+           maxeval, Gamma3, Gamma2, Gamma1, Gamma1 + Gamma2 + Gamma3);
+}
+
 /* ------- Main function ------ */
 
 
@@ -1467,17 +1477,18 @@ int main(int argc, char** argv){
     validate_fixed_points(q, T, gL, gR, lambda);
     if (argc == 2 && strcmp(argv[1], "--validate-only") == 0)
         return 0;
-    // /*
-    double Gamma3 = GammaPp3(m_e, m_e, 0.0, q, T, gL, gR, lambda);
-    cout << Gamma3 << endl;
-    cout << "#########################" << endl;
-    double Gamma2 = GammaPp2(m_e, m_e, 0.0, q, T, gL, gR, lambda);
-    cout << Gamma2 << endl;
-    double Gamma1 = GammaPp1(m_e, m_e, 0.0, q, T, gL, gR, lambda);
-    cout << Gamma1 << endl;
-    cout << Gamma1+Gamma2+Gamma3 << endl;
+    if (argc == 2 && strcmp(argv[1], "--convergence") == 0) {
+        const int caps[] = {200000, 500000, 1000000};
+        for (size_t i = 0; i < sizeof(caps)/sizeof(caps[0]); ++i)
+            run_channels(q, T, gL, gR, lambda, caps[i]);
+        return 0;
+    }
+    if (argc != 1) {
+        fprintf(stderr, "usage: %s [--validate-only|--convergence]\n", argv[0]);
+        return 2;
+    }
+    run_channels(q, T, gL, gR, lambda, DEFAULT_MAXEVAL);
     cout << "END" << endl;
-    // */
     
      /*
     FILE *fptr;
