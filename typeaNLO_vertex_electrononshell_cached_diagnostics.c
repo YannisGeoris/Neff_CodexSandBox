@@ -23,11 +23,14 @@ using namespace std;
 #define NVEC 1
 #define EPSREL 1e-1 //5e-2 is the default one
 #define EPSRELGSL 1e-1 //5e-2
-#define EPSABS 0
+// The raw Cuhre integral is normally O(1). This absolute floor prevents a
+// cancellation-dominated channel from demanding an unattainable relative error.
+#define EPSABS 1e-6
 #define VERBOSE 0
 #define LAST 4
 #define MINEVAL 0
-#define MAXEVAL 1e8
+#define MAXEVAL 200000 // diagnostic cap; raise only after inspecting convergence
+#define GSL_LIMIT 5000 // convergence-test this in the range 1000--10000
 //#define LIMIT 1e8 // not sure needed here
 
 
@@ -394,6 +397,66 @@ double Bose1D(double E,double T){
 
 
 
+/* ----- Reusable, diagnosed GSL integration ----- */
+
+struct QagResult {
+    double value;
+    double abserr;
+    int status;
+    size_t subdivisions;
+};
+
+struct InnerQuadratureStats {
+    unsigned long calls;
+    unsigned long failures;
+    size_t max_subdivisions;
+    double max_abserr;
+};
+
+static thread_local InnerQuadratureStats inner_stats = {0, 0, 0, 0.0};
+
+class WorkerWorkspace {
+public:
+    WorkerWorkspace() : workspace(gsl_integration_workspace_alloc(GSL_LIMIT)) {
+        if (workspace == NULL) {
+            fprintf(stderr, "fatal: unable to allocate GSL workspace (limit=%d)\n", GSL_LIMIT);
+            abort();
+        }
+    }
+    ~WorkerWorkspace() { gsl_integration_workspace_free(workspace); }
+    gsl_integration_workspace *get() { return workspace; }
+private:
+    gsl_integration_workspace *workspace;
+};
+
+static gsl_integration_workspace *worker_workspace(){
+    static thread_local WorkerWorkspace holder;
+    return holder.get();
+}
+
+static QagResult qag_checked(gsl_function *F, const char *label){
+    QagResult out = {NAN, NAN, GSL_EFAILED, 0};
+    gsl_integration_workspace *w = worker_workspace();
+    out.status = gsl_integration_qag(F, 0.0, 1.0, 0.0, EPSRELGSL,
+                                     GSL_LIMIT, 2, w, &out.value, &out.abserr);
+    out.subdivisions = w->size;
+    inner_stats.calls++;
+    if (out.subdivisions > inner_stats.max_subdivisions)
+        inner_stats.max_subdivisions = out.subdivisions;
+    if (isfinite(out.abserr) && out.abserr > inner_stats.max_abserr)
+        inner_stats.max_abserr = out.abserr;
+    if (out.status != GSL_SUCCESS || !isfinite(out.value) || !isfinite(out.abserr)) {
+        inner_stats.failures++;
+        fprintf(stderr,
+                "GSL qag failure: integral=%s status=%d (%s) value=% .9e "
+                "abserr=%.3e subdivisions=%zu/%d\n",
+                label, out.status, gsl_strerror(out.status), out.value,
+                out.abserr, out.subdivisions, GSL_LIMIT);
+        out.value = NAN;
+    }
+    return out;
+}
+
 /*----- Integrand for the vertex part where electrons on-shell ----*/ 
 
 
@@ -461,23 +524,15 @@ double Integrand_elec(double kabs, void *pars){
 }
 
 double I_elec(double T, double p1[4], double p2[4], double lambda){
-    double result1, result2, abserr; 
-    size_t limit = 10000000,nevals; // size_t stores the maximum size of an array
-    gsl_integration_workspace * w = gsl_integration_workspace_alloc(limit);
-    gsl_function F; 
-    // compute first part of kinematic space
-    struct Integrand_param_elec  parameter1 = {T, p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], 1.0, lambda};
-    F.function =  &Integrand_elec;
-    F.params = &parameter1; 
-    gsl_integration_qag(&F, 0., 1., 0.,EPSRELGSL, limit, 2, w, &result1, &abserr);
-    // compute second part of kinematic space
-    struct Integrand_param_elec  parameter2 = {T, p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], -1.0, lambda};
-    F.function =  &Integrand_elec;
-    F.params = &parameter2; 
-    gsl_integration_qag(&F, 0., 1., 0.,EPSRELGSL, limit, 2, w, &result2, &abserr);
-    // deallocate GSL workspace
-    gsl_integration_workspace_free(w);
-    return result1+result2;
+    gsl_function F;
+    struct Integrand_param_elec parameter1 = {T, p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], 1.0, lambda};
+    F.function = &Integrand_elec;
+    F.params = &parameter1;
+    QagResult first = qag_checked(&F, "Is(+)");
+    struct Integrand_param_elec parameter2 = {T, p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], -1.0, lambda};
+    F.params = &parameter2;
+    QagResult second = qag_checked(&F, "Is(-)");
+    return first.value + second.value;
 }
 
 
@@ -536,23 +591,15 @@ double Integrand_elec_Ju(double kabs, void *pars){
 }
 
 double Ju_fun(double T, double p1[4], double p2[4], double Is, double lambda){
-    double result1, result2, abserr; 
-    size_t limit = 10000000,nevals; // size_t stores the maximum size of an array
-    gsl_integration_workspace * w = gsl_integration_workspace_alloc(limit);
-    gsl_function F; 
-    // compute first part of kinematic space
-    struct Integrand_param_elec_Ju  parameter1 = {T, p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], 1.0, lambda};
-    F.function =  &Integrand_elec_Ju;
-    F.params = &parameter1; 
-    gsl_integration_qag(&F, 0., 1., 0.,EPSRELGSL, limit, 2, w, &result1, &abserr);
-    // compute second part of kinematic space
-    struct Integrand_param_elec_Ju  parameter2 = {T, p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], -1.0, lambda};
-    F.function =  &Integrand_elec_Ju;
-    F.params = &parameter2; 
-    gsl_integration_qag(&F, 0., 1., 0.,EPSRELGSL, limit, 2, w, &result2, &abserr);
-    // deallocate GSL workspace
-    gsl_integration_workspace_free(w);
-    return result1+result2 - p2[0]*Is;
+    gsl_function F;
+    struct Integrand_param_elec_Ju parameter1 = {T, p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], 1.0, lambda};
+    F.function = &Integrand_elec_Ju;
+    F.params = &parameter1;
+    QagResult first = qag_checked(&F, "Ju(+)");
+    struct Integrand_param_elec_Ju parameter2 = {T, p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], -1.0, lambda};
+    F.params = &parameter2;
+    QagResult second = qag_checked(&F, "Ju(-)");
+    return first.value + second.value - p2[0]*Is;
 }
 
 
@@ -579,51 +626,39 @@ double Integrand_elec_J12(double kabs, void *pars){
 }
 
 double J12_fun(double T, double p[4], double m){
-    double result, abserr; 
-    size_t limit = 10000000,nevals; // size_t stores the maximum size of an array
-    gsl_integration_workspace * w = gsl_integration_workspace_alloc(limit);
-    gsl_function F; 
-    // compute first part of kinematic space
-    struct Integrand_param_elec_J12  parameter = {T, p[0], p[1], p[2], p[3], m};
-    F.function =  &Integrand_elec_J12;
-    F.params = &parameter; 
-    gsl_integration_qag(&F, 0., 1., 0.,EPSRELGSL, limit, 2, w, &result, &abserr);
-    // deallocate GSL workspace
-    gsl_integration_workspace_free(w);
-    return result;
+    gsl_function F;
+    struct Integrand_param_elec_J12 parameter = {T, p[0], p[1], p[2], p[3], m};
+    F.function = &Integrand_elec_J12;
+    F.params = &parameter;
+    return qag_checked(&F, "J12").value;
 }
 
 
 
 
-void I_elec_Vec(double T, double p1[4], double p2[4], double Is, double lambda, double IV[4]){
-// /*
-    double p2mp1[4];
-    combili4vector(p2, p1, 1.0, -1.0, p2mp1);
+struct VertexBasis {
+    double Is, Ju;
+    double Jgamma, Je;
+    double Tgamma, Te;
+    double Lgammae, Legamma;
+    double K, Tuu_direct;
+    bool valid;
+};
 
-    double Ju = Ju_fun(T, p1, p2, Is, lambda);
-/////////// ATTTENTION IN PRINCIPLE SHOULD REMOVE LAMBDA BELOW BUT UNSTABLE OTHERWISE  //////////////////////////////////////////////////
-    double J1 = J12_fun(T, p2, lambda)-J12_fun(T, p2mp1, m_e);
-    double J2 = -J12_fun(T, p2mp1, m_e);
-    double E1 = p1[0];//both can be negative, just shortcut notation
+void I_elec_Vec(double p1[4], double p2[4], const VertexBasis &basis, double IV[4]){
+    double J1 = basis.Jgamma-basis.Je;
+    double J2 = -basis.Je;
+    double E1 = p1[0];
     double E2 = p2[0];
     double p1p2 = dotvector(p1, p2);
-    
-    
     double Delta =-pow2(E1)*pow2(m_e)-pow2(E2)*pow2(m_e)+pow2(pow2(m_e))+2*E1*E2*p1p2-pow2(p1p2);
-    
-    double IV1 = ((pow2(m_e)-pow2(E2))*J1+(E1*E2-p1p2)*J2+(-E1*pow2(m_e)+E2*p1p2)*Ju)/Delta;
-    double IV2 = ((E1*E2 - p1p2)*J1+(pow2(m_e) - pow2(E1))*J2+(-E2*pow2(m_e) + E1*p1p2)*Ju)/Delta;
-    double IV3 = ((-E1*pow2(m_e) + E2*p1p2)*J1+(-E2*pow2(m_e) + E1*p1p2)*J2+(pow2(pow2(m_e)) - pow2(p1p2))*Ju)/Delta;
-    
+    double IV1 = ((pow2(m_e)-pow2(E2))*J1+(E1*E2-p1p2)*J2+(-E1*pow2(m_e)+E2*p1p2)*basis.Ju)/Delta;
+    double IV2 = ((E1*E2 - p1p2)*J1+(pow2(m_e) - pow2(E1))*J2+(-E2*pow2(m_e) + E1*p1p2)*basis.Ju)/Delta;
+    double IV3 = ((-E1*pow2(m_e) + E2*p1p2)*J1+(-E2*pow2(m_e) + E1*p1p2)*J2+(pow2(pow2(m_e)) - pow2(p1p2))*basis.Ju)/Delta;
     double u_plasma[4];
     vec4(1.0, 0.0, 0.0, 0.0, u_plasma);
-//  */  
-        // Reconstruct vector
-    for(int i=0; i<4; i++){
+    for(int i=0; i<4; i++)
         IV[i] = IV1*p1[i]+ IV2*p2[i]+ IV3*u_plasma[i];
-    }
-    return;
 }
 
 
@@ -694,24 +729,11 @@ double Integrand_T(double kabs, void *pars){
 }
 
 double T_fun(double T, double p[4], double m){
-
-    double result, abserr;
-    size_t limit = 10000000, nevals;
-
-    gsl_integration_workspace *w = gsl_integration_workspace_alloc(limit);
-
     gsl_function F;
-
     Integrand_param_T parameter = {T,p[0],p[1],p[2],p[3],m};
-
     F.function = &Integrand_T;
     F.params = &parameter;
-
-    gsl_integration_qag(&F,0.0,1.0,0.0,EPSRELGSL,limit,2,w,&result,&abserr);
-
-    gsl_integration_workspace_free(w);
-
-    return result;
+    return qag_checked(&F, "T").value;
 }
 
 
@@ -730,24 +752,22 @@ double Integrand_K(double kabs, void *pars){
 }
 
 double K_fun(double T){
-
-    double result, abserr;
-    size_t limit = 10000000, nevals;
-
-    gsl_integration_workspace *w = gsl_integration_workspace_alloc(limit);
-
     gsl_function F;
-
     Integrand_param_K parameter = {T};
-
     F.function = &Integrand_K;
     F.params = &parameter;
+    return qag_checked(&F, "K").value;
+}
 
-    gsl_integration_qag(&F,0.0,1.0,0.0,EPSRELGSL,limit,2,w,&result,&abserr);
+static double cached_K_temperature = NAN;
+static double cached_K_value = NAN;
 
-    gsl_integration_workspace_free(w);
-
-    return result;
+static double K_cached(double T){
+    if (!isfinite(cached_K_value) || T != cached_K_temperature) {
+        cached_K_value = K_fun(T);
+        cached_K_temperature = T;
+    }
+    return cached_K_value;
 }
 
 
@@ -796,24 +816,11 @@ double Integrand_L(double kabs, void *pars){
 }
 
 double L_fun(double T, double p[4], double q[4], double mp, double mq){
-
-    double result, abserr;
-    size_t limit = 10000000, nevals;
-
-    gsl_integration_workspace *w = gsl_integration_workspace_alloc(limit);
-
     gsl_function F;
-
     Integrand_param_L parameter = {T,p[0],p[1],p[2],p[3],q[0],q[1],q[2],q[3],mp,mq};
-
     F.function = &Integrand_L;
     F.params = &parameter;
-
-    gsl_integration_qag(&F,0.0,1.0,0.0,EPSRELGSL,limit,2,w,&result,&abserr);
-
-    gsl_integration_workspace_free(w);
-
-    return result;
+    return qag_checked(&F, "L").value;
 }
 
 
@@ -865,23 +872,15 @@ double Integrand_elec_tensor(double kabs, void *pars){
 }
 
 double I_elec_tensor_uupart(double T, double p1[4], double p2[4], double lambda){
-    double result1, result2, abserr; 
-    size_t limit = 10000000,nevals; // size_t stores the maximum size of an array
-    gsl_integration_workspace * w = gsl_integration_workspace_alloc(limit);
-    gsl_function F; 
-    // compute first part of kinematic space
-    struct Integrand_param_elec_tensor  parameter1 = {T, p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], 1.0, lambda};
-    F.function =  &Integrand_elec_tensor;
-    F.params = &parameter1; 
-    gsl_integration_qag(&F, 0., 1., 0.,EPSRELGSL, limit, 2, w, &result1, &abserr);
-    // compute second part of kinematic space
-    struct Integrand_param_elec_tensor  parameter2 = {T, p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], -1.0, lambda};
-    F.function =  &Integrand_elec_tensor;
-    F.params = &parameter2; 
-    gsl_integration_qag(&F, 0., 1., 0.,EPSRELGSL, limit, 2, w, &result2, &abserr);
-    // deallocate GSL workspace
-    gsl_integration_workspace_free(w);
-    return result1+result2;
+    gsl_function F;
+    struct Integrand_param_elec_tensor parameter1 = {T, p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], 1.0, lambda};
+    F.function = &Integrand_elec_tensor;
+    F.params = &parameter1;
+    QagResult first = qag_checked(&F, "Tuu(+)");
+    struct Integrand_param_elec_tensor parameter2 = {T, p1[0], p1[1], p1[2], p1[3], p2[0], p2[1], p2[2], p2[3], -1.0, lambda};
+    F.params = &parameter2;
+    QagResult second = qag_checked(&F, "Tuu(-)");
+    return first.value + second.value;
 }
 
 
@@ -891,62 +890,55 @@ double I_elec_tensor_uupart(double T, double p1[4], double p2[4], double lambda)
 
 
 
+static VertexBasis build_vertex_basis(double T, double p1[4], double p2[4],
+                                      double lambda, double cached_K){
+    VertexBasis basis;
+    double p2mp1[4];
+    combili4vector(p2, p1, 1.0, -1.0, p2mp1);
+    basis.Is = I_elec(T, p1, p2, lambda);
+    basis.Ju = Ju_fun(T, p1, p2, basis.Is, lambda);
+    basis.Jgamma = J12_fun(T, p2, lambda);
+    basis.Je = J12_fun(T, p2mp1, m_e);
+    basis.Tgamma = T_fun(T, p2, lambda);
+    basis.Te = T_fun(T, p2mp1, m_e);
+    basis.Lgammae = L_fun(T, p2, p2mp1, lambda, m_e);
+    basis.Legamma = L_fun(T, p2mp1, p2, m_e, lambda);
+    basis.Tuu_direct = I_elec_tensor_uupart(T, p1, p2, lambda);
+    basis.K = cached_K;
+    basis.valid = isfinite(basis.Is) && isfinite(basis.Ju) &&
+                  isfinite(basis.Jgamma) && isfinite(basis.Je) &&
+                  isfinite(basis.Tgamma) && isfinite(basis.Te) &&
+                  isfinite(basis.Lgammae) && isfinite(basis.Legamma) &&
+                  isfinite(basis.Tuu_direct) && isfinite(basis.K);
+    return basis;
+}
+
 // Combine everything into the final tensor
 
 
-void I_elec_Tensor(double T, double p1[4], double p2[4], double Is, double IV[4], double lambda, double IT[4][4]){
-// /*
+void I_elec_Tensor(double p1[4], double p2[4], const VertexBasis &basis,
+                   double IV[4], double IT[4][4]){
     double u_plasma[4];
     vec4(1.0, 0.0, 0.0, 0.0, u_plasma);
-    double p2mp1[4];
-    combili4vector(p2, p1, 1.0, -1.0, p2mp1);
-    double E1 = p1[0];//both can be negative, just shortcut notation
     double E2 = p2[0];
-    double p1p2 = dotvector(p1, p2);
 
-    
-    // Doing Tuu first
-    double Ju = Ju_fun(T, p1, p2, Is, lambda);
-    double Tuu_newcontrib = I_elec_tensor_uupart( T, p1, p2, lambda);
-    double Tuu = Tuu_newcontrib - 2*E2*Ju - pow2(E2)*Is;
-    
-    // Then Tg
+    double Tuu = basis.Tuu_direct - 2*E2*basis.Ju - pow2(E2)*basis.Is;
     double Tg = -2*dotvector(p2,IV);
-    
-    // Then T1u and T2u
-    /////////////////////////////////// ATTENTION REMOVE THE LAMBDA WHEN POSSIBLE, FOR NOW MORE STABLE.... ////////////////////////
-    double Tcalp2 = T_fun(T, p2,lambda); //caligraphic T
-    double Tcalp2mp1 = T_fun(T, p2mp1, m_e);
-    double Jp2 = J12_fun(T, p2, lambda);
-    double Jp2mp1 = J12_fun(T, p2mp1, m_e);
+    double T1u = basis.Tgamma-basis.Te-E2*(basis.Jgamma-basis.Je);
+    double T2u = -basis.Te+E2*basis.Je;
+    double T22 = basis.Lgammae/4;
+    double T11 = (basis.Lgammae+basis.Legamma)/4-basis.K/2;
+    double T12 = basis.Lgammae/4-basis.K/4;
 
-    double T1u = Tcalp2-Tcalp2mp1-E2*(Jp2-Jp2mp1);
-    double T2u = -Tcalp2mp1+E2*Jp2mp1;
-    
-    
-    // Finally, T_11, T_22 and T_12
-    double Lp2p2mp1 = L_fun(T, p2, p2mp1, lambda, m_e);
-    double Lp2mp1p2 = L_fun(T, p2mp1, p2, m_e, lambda);
-    double Kp2 = K_fun(T);
-    
-    double T22 = Lp2p2mp1/4;
-    double T11 = (Lp2p2mp1+Lp2mp1p2)/4-Kp2/2;
-    double T12 = Lp2p2mp1/4-Kp2/4;
-
-
-    // Define matrix necessary for inversion + do the product
     Matrix7d Ginv = inverse_GT(p1,p2);
     Eigen::Matrix<double,7,1> Tij;
     Tij << T11, T12, T22, T1u, T2u, Tuu, Tg;
     Eigen::Matrix<double,7,1> ITcoeff = Ginv*Tij;
-// */    
-        // Reconstruct tensor
     for(int i=0; i<4; i++){
       for(int j=0; j<4; j++){
         IT[i][j] = ITcoeff(0)*p1[i]*p1[j]+ITcoeff(1)*(p1[i]*p2[j]+p1[j]*p2[i])+ITcoeff(2)*(p1[i]*u_plasma[j]+p1[j]*u_plasma[i])+ITcoeff(3)*p2[i]*p2[j]+ITcoeff(4)*(p2[i]*u_plasma[j]+p2[j]*u_plasma[i])+ITcoeff(5)*u_plasma[i]*u_plasma[j]+ITcoeff(6)*gmunu[i][j];
-        }
+      }
     }
-    return;
 }
 
 
@@ -1123,22 +1115,24 @@ double integrand2to2p3(double p3mod, double theta, double theta_hat, double phi_
         double P2_labm[4];
         combili4vector(P2_lab,Q,-1.0,0.0,P2_labm);
         
-        //Scalar
-        double Is1 = I_elec(T, P1_lab, P2_labm, lambda);
-        double Is2 = I_elec(T, P2_labm, P1_lab, lambda);
-        Is = Is1 + Is2;
-        //Vector
+        double cached_K = K_cached(T);
+        VertexBasis basis1 = build_vertex_basis(T, P1_lab, P2_labm, lambda, cached_K);
+        VertexBasis basis2 = build_vertex_basis(T, P2_labm, P1_lab, lambda, cached_K);
+        if (!basis1.valid || !basis2.valid) {
+            fprintf(stderr, "reject p3 point: p=%.9e theta=%.9e theta_hat=%.9e phi_hat=%.9e\n", p3mod, theta, theta_hat, phi_hat);
+            return 0.0;
+        }
+        Is = basis1.Is + basis2.Is;
         double IV_lab1[4], IV_lab2[4];
-        I_elec_Vec(T, P1_lab, P2_labm, Is1, lambda, IV_lab1);
-        I_elec_Vec(T, P2_labm, P1_lab, Is2, lambda, IV_lab2);
+        I_elec_Vec(P1_lab, P2_labm, basis1, IV_lab1);
+        I_elec_Vec(P2_labm, P1_lab, basis2, IV_lab2);
         combili4vector(IV_lab1,IV_lab2,1.0,1.0,IV_lab);
-        boost(P3Q,IV_lab, IV);    //res += 32*(-(pow2(gL)+pow2(gR))*P1IV*P2P3*P2Q+ gL*((P2IV)*(gL*P1P3*P2Q - gR*m1*m2*P3Q)+ gL*P1P2*P2Q*P3IV)+ pow2(gR)*P1Q*P2P3*P2IV+ pow2(gR)*P1P2*P2P3*QIV); // First vector contribution
-        //Tensor
+        boost(P3Q,IV_lab, IV);
         double It_lab1[4][4], It_lab2[4][4];
-        I_elec_Tensor(T, P1_lab, P2_labm, Is1, IV_lab1, lambda, It_lab1);
-        I_elec_Tensor(T, P2_labm, P1_lab, Is2, IV_lab2, lambda, It_lab2);
+        I_elec_Tensor(P1_lab, P2_labm, basis1, IV_lab1, It_lab1);
+        I_elec_Tensor(P2_labm, P1_lab, basis2, IV_lab2, It_lab2);
         combilitensor(It_lab1,It_lab2,1.0,1.0,It_lab);
-        boost_tensor(P3Q,It_lab, It); // boost tensor in correct frame...
+        boost_tensor(P3Q,It_lab, It);
         
         
         /* OLD momenta, wrong, forgot sign change
@@ -1186,12 +1180,12 @@ double GammaPp3(double m1, double m2, double m3, double q, double T, double gL, 
     int nregions, neval, fail;
     double integral[NCOMP], error[NCOMP], prob[NCOMP];
     double args[8] = {m1,m2,m3,q,T,gL,gR,lambda};
+    K_cached(T);
+    auto start = chrono::steady_clock::now();
     Cuhre(NDIM, NCOMP, integrand2to2p3_changevariable, args, NVEC, EPSREL, EPSABS, VERBOSE | LAST, MINEVAL, MAXEVAL, KEY, STATEFILE, SPIN, &nregions, &neval, &fail, integral, error, prob);
-
-    printf("CUHRE RESULT:\tnregions %d\tneval %d\tfail %d\n",nregions, neval, fail);
-    printf("CUHRE RESULT:\t%e +- %e\tp = %e\n",integral[0], error[0], prob[0]);
-
-    return -8.0*pow2(GF)*e2*(1.0+exp(-q/T))/q*integral[0]/pow3(2*M_PI) ; // Additional minus sign from the difference between NLO and LO: No extra fermion loop but no sign in on-shell part of D^F, 1/(2pi)^3 because of 2pi in the photon propagator and integration measure that were not accounted for yet, factor 8 not 16 because only one way to put photon on-shell in vertex correction (while 2 ways in photon self-energy)
+    double seconds = chrono::duration<double>(chrono::steady_clock::now()-start).count();
+    printf("CUHRE p3: nregions=%d neval=%d fail=%d value=% .9e error=%.3e prob=%.3e elapsed=%.3fs eval/s=%.1f epsrel=%.1e epsabs=%.1e maxeval=%d\n", nregions, neval, fail, integral[0], error[0], prob[0], seconds, seconds > 0.0 ? neval/seconds : 0.0, EPSREL, EPSABS, MAXEVAL);
+    return -8.0*pow2(GF)*e2*(1.0+exp(-q/T))/q*integral[0]/pow3(2*M_PI);
 }
 
 
@@ -1243,22 +1237,24 @@ double integrand2to2p2(double p2mod, double theta, double theta_hat, double phi_
         
         
         boost_inv(P2Q,P1,P1_lab);
-        //Scalar
-        double Is1 = I_elec(T, P1_lab, P2, lambda);
-        double Is2 = I_elec(T, P2, P1_lab, lambda);
-        Is = Is1 + Is2;
-        //Vector
+        double cached_K = K_cached(T);
+        VertexBasis basis1 = build_vertex_basis(T, P1_lab, P2, lambda, cached_K);
+        VertexBasis basis2 = build_vertex_basis(T, P2, P1_lab, lambda, cached_K);
+        if (!basis1.valid || !basis2.valid) {
+            fprintf(stderr, "reject p2 point: p=%.9e theta=%.9e theta_hat=%.9e phi_hat=%.9e\n", p2mod, theta, theta_hat, phi_hat);
+            return 0.0;
+        }
+        Is = basis1.Is + basis2.Is;
         double IV_lab1[4], IV_lab2[4];
-        I_elec_Vec(T, P1_lab, P2, Is1, lambda, IV_lab1);
-        I_elec_Vec(T, P2, P1_lab, Is2, lambda, IV_lab2);
+        I_elec_Vec(P1_lab, P2, basis1, IV_lab1);
+        I_elec_Vec(P2, P1_lab, basis2, IV_lab2);
         combili4vector(IV_lab1,IV_lab2,1.0,1.0,IV_lab);
         boost(P2Q,IV_lab, IV);
-        //Tensor
         double It_lab1[4][4], It_lab2[4][4];
-        I_elec_Tensor(T, P1_lab, P2, Is1, IV_lab1, lambda, It_lab1);
-        I_elec_Tensor(T, P2, P1_lab, Is2, IV_lab2, lambda, It_lab2);
+        I_elec_Tensor(P1_lab, P2, basis1, IV_lab1, It_lab1);
+        I_elec_Tensor(P2, P1_lab, basis2, IV_lab2, It_lab2);
         combilitensor(It_lab1,It_lab2,1.0,1.0,It_lab);
-        boost_tensor(P2Q,It_lab, It); // boost tensor in correct frame...
+        boost_tensor(P2Q,It_lab, It);
 
         multSZ = 1.0/pow2(4*M_PI);
         mult0 = 1.0/pow2(2*M_PI);
@@ -1296,12 +1292,12 @@ double GammaPp2(double m1, double m2, double m3, double q, double T, double gL, 
     int nregions, neval, fail;
     double integral[NCOMP], error[NCOMP], prob[NCOMP];
     double args[8] = {m1,m2,m3,q,T,gL,gR,lambda};
+    K_cached(T);
+    auto start = chrono::steady_clock::now();
     Cuhre(NDIM, NCOMP, integrand2to2p2_changevariable, args, NVEC, EPSREL, EPSABS, VERBOSE | LAST, MINEVAL, MAXEVAL, KEY, STATEFILE, SPIN, &nregions, &neval, &fail, integral, error, prob);
-
-    printf("CUHRE RESULT:\tnregions %d\tneval %d\tfail %d\n",nregions, neval, fail);
-    printf("CUHRE RESULT:\t%e +- %e\tp = %e\n",integral[0], error[0], prob[0]);
-
-    return -8.0*pow2(GF)*e2*(1.0+exp(-q/T))/q*integral[0]/pow3(2*M_PI) ;// Additional minus sign from the difference between NLO and LO: Not because extra fermion loop this time but because no minus sign in on-shell part of D^F (see draft)
+    double seconds = chrono::duration<double>(chrono::steady_clock::now()-start).count();
+    printf("CUHRE p2: nregions=%d neval=%d fail=%d value=% .9e error=%.3e prob=%.3e elapsed=%.3fs eval/s=%.1f epsrel=%.1e epsabs=%.1e maxeval=%d\n", nregions, neval, fail, integral[0], error[0], prob[0], seconds, seconds > 0.0 ? neval/seconds : 0.0, EPSREL, EPSABS, MAXEVAL);
+    return -8.0*pow2(GF)*e2*(1.0+exp(-q/T))/q*integral[0]/pow3(2*M_PI);
 }
 
 /* -------- p1 -------- */
@@ -1356,22 +1352,24 @@ double integrand2to2p1(double p1mod, double theta, double theta_hat, double phi_
         double P1m[4], P2_labm[4];
         combili4vector(P1,Q,-1.0,0.0,P1m);
         combili4vector(P2_lab,Q,-1.0,0.0,P2_labm);
-        //Scalar
-        double Is1 = I_elec(T, P1m, P2_labm, lambda);
-        double Is2 = I_elec(T, P2_labm, P1m, lambda);
-        Is = Is1 + Is2;
-        //Vector
+        double cached_K = K_cached(T);
+        VertexBasis basis1 = build_vertex_basis(T, P1m, P2_labm, lambda, cached_K);
+        VertexBasis basis2 = build_vertex_basis(T, P2_labm, P1m, lambda, cached_K);
+        if (!basis1.valid || !basis2.valid) {
+            fprintf(stderr, "reject p1 point: p=%.9e theta=%.9e theta_hat=%.9e phi_hat=%.9e\n", p1mod, theta, theta_hat, phi_hat);
+            return 0.0;
+        }
+        Is = basis1.Is + basis2.Is;
         double IV_lab1[4], IV_lab2[4];
-        I_elec_Vec(T, P1m, P2_labm, Is1, lambda, IV_lab1);
-        I_elec_Vec(T, P2_labm, P1m, Is2, lambda, IV_lab2);
+        I_elec_Vec(P1m, P2_labm, basis1, IV_lab1);
+        I_elec_Vec(P2_labm, P1m, basis2, IV_lab2);
         combili4vector(IV_lab1,IV_lab2,1.0,1.0,IV_lab);
         boost(P1Q,IV_lab, IV);
-        //Tensor
         double It_lab1[4][4], It_lab2[4][4];
-        I_elec_Tensor(T, P1m, P2_labm, Is1, IV_lab1, lambda, It_lab1);
-        I_elec_Tensor(T, P2_labm, P1m, Is2, IV_lab2, lambda, It_lab2);
+        I_elec_Tensor(P1m, P2_labm, basis1, IV_lab1, It_lab1);
+        I_elec_Tensor(P2_labm, P1m, basis2, IV_lab2, It_lab2);
         combilitensor(It_lab1,It_lab2,1.0,1.0,It_lab);
-        boost_tensor(P1Q,It_lab, It); // boost tensor in correct frame...
+        boost_tensor(P1Q,It_lab, It);
 
         /* OLD: WRONG SIGNS
         Is = I_elec(T, P1, P2_lab, lambda);
@@ -1418,18 +1416,40 @@ double GammaPp1(double m1, double m2, double m3, double q, double T, double gL, 
     int nregions, neval, fail;
     double integral[NCOMP], error[NCOMP], prob[NCOMP];
     double args[8] = {m1,m2,m3,q,T,gL,gR,lambda};
+    K_cached(T);
+    auto start = chrono::steady_clock::now();
     Cuhre(NDIM, NCOMP, integrand2to2p1_changevariable, args, NVEC, EPSREL, EPSABS, VERBOSE | LAST, MINEVAL, MAXEVAL, KEY, STATEFILE, SPIN, &nregions, &neval, &fail, integral, error, prob);
-
-    printf("CUHRE RESULT:\tnregions %d\tneval %d\tfail %d\n",nregions, neval, fail);
-    printf("CUHRE RESULT:\t%e +- %e\tp = %e\n",integral[0], error[0], prob[0]);
-
-    return -8.0*pow2(GF)*e2*(1.0+exp(-q/T))/q*integral[0]/pow3(2*M_PI) ;// Additional minus sign from the difference between NLO and LO: Not because extra fermion loop this time but because no minus sign in on-shell part of D^F (see draft)
+    double seconds = chrono::duration<double>(chrono::steady_clock::now()-start).count();
+    printf("CUHRE p1: nregions=%d neval=%d fail=%d value=% .9e error=%.3e prob=%.3e elapsed=%.3fs eval/s=%.1f epsrel=%.1e epsabs=%.1e maxeval=%d\n", nregions, neval, fail, integral[0], error[0], prob[0], seconds, seconds > 0.0 ? neval/seconds : 0.0, EPSREL, EPSABS, MAXEVAL);
+    return -8.0*pow2(GF)*e2*(1.0+exp(-q/T))/q*integral[0]/pow3(2*M_PI);
 }
 
 
 
 
 
+
+typedef double (*FixedPointIntegrand)(double, double, double, double, double, double,
+                                     double, double, double, double, double, double);
+
+static void validate_fixed_point(const char *label, FixedPointIntegrand integrand,
+                                 double q, double T, double gL, double gR, double lambda){
+    inner_stats = {0, 0, 0, 0.0};
+    auto start = chrono::steady_clock::now();
+    double value = integrand(5.0, 1.0, 1.0, 1.0, m_e, m_e, 0.0,
+                             q, T, gL, gR, lambda);
+    double seconds = chrono::duration<double>(chrono::steady_clock::now()-start).count();
+    printf("FIXED %s: value=% .17e elapsed=%.6fs qag_calls=%lu failures=%lu max_subdivisions=%zu max_abserr=%.3e\n",
+           label, value, seconds, inner_stats.calls, inner_stats.failures,
+           inner_stats.max_subdivisions, inner_stats.max_abserr);
+}
+
+static void validate_fixed_points(double q, double T, double gL, double gR, double lambda){
+    K_cached(T); // evaluated once, before any outer cubature or per-orientation work
+    validate_fixed_point("p3", integrand2to2p3, q, T, gL, gR, lambda);
+    validate_fixed_point("p2", integrand2to2p2, q, T, gL, gR, lambda);
+    validate_fixed_point("p1", integrand2to2p1, q, T, gL, gR, lambda);
+}
 
 /* ------- Main function ------ */
 
@@ -1443,6 +1463,10 @@ int main(int argc, char** argv){
     T = 3.0;
     lambda = 0.005; 
     q = 3.15*T;
+    gsl_set_error_handler_off();
+    validate_fixed_points(q, T, gL, gR, lambda);
+    if (argc == 2 && strcmp(argv[1], "--validate-only") == 0)
+        return 0;
     // /*
     double Gamma3 = GammaPp3(m_e, m_e, 0.0, q, T, gL, gR, lambda);
     cout << Gamma3 << endl;
