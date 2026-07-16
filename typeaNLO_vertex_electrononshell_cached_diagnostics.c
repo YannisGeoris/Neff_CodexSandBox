@@ -1490,23 +1490,32 @@ int main(int argc, char** argv){
     run_channels(q, T, gL, gR, lambda, DEFAULT_MAXEVAL);
     cout << "END" << endl;
     
-     /*
-    FILE *fptr;
-    fptr = fopen("/home/ygeoris/c++code/Dataset/Typeavertex_5e-2_scalar_decomposed_electrononshell_withFeynmantrick.csv","w+"); //Typeavertex //Typeaphotoncut
+    /*
+    const char *output_path =
+        "/home/ygeoris/c++code/Dataset/Typeavertex_electrononshell_cached_diagnostics.csv";
+    FILE *fptr = fopen(output_path, "w");
+    if (fptr == NULL) {
+        perror(output_path);
+        return 1;
+    }
+    const int size = 25;
+    const int maxeval = DEFAULT_MAXEVAL;
+    fprintf(fptr,"EPSREL = %e\n", EPSREL);
     fprintf(fptr,"EPSRELGSL = %e\n", EPSRELGSL);
+    fprintf(fptr,"EPSABS = %e\n", EPSABS);
+    fprintf(fptr,"MAXEVAL = %d\n", maxeval);
     fprintf(fptr,"T q lambda Gamma Gamma1 Gamma2 Gamma3\n");
-    double size = 25.0;
-    double Gamma;
     for(int i=0;i<size;i++){
         T = 0.5+0.1*i;
         q = 3.15*T;
         lambda = 0.005;//5; //T*pow(10,i/size*5-4);
-        double Gamma3 = GammaPp3(m_e, m_e, 0.0, q, T, gL, gR, lambda);
-        double Gamma2 = GammaPp2(m_e, m_e, 0.0, q, T, gL, gR, lambda);
-        double Gamma1 = GammaPp1(m_e, m_e, 0.0, q, T, gL, gR, lambda);
-        Gamma = Gamma1+Gamma2+Gamma3;
-    	cout << i << " " << Gamma << endl;
-    	fprintf(fptr,"%e %e %e %e %e %e %e \n",T, q, lambda, Gamma, Gamma1, Gamma2, Gamma3);}
+        double Gamma3 = GammaPp3(m_e, m_e, 0.0, q, T, gL, gR, lambda, maxeval);
+        double Gamma2 = GammaPp2(m_e, m_e, 0.0, q, T, gL, gR, lambda, maxeval);
+        double Gamma1 = GammaPp1(m_e, m_e, 0.0, q, T, gL, gR, lambda, maxeval);
+        double Gamma = Gamma1+Gamma2+Gamma3;
+        cout << i << " " << Gamma << endl;
+        fprintf(fptr,"%e %e %e %e %e %e %e\n",T, q, lambda, Gamma, Gamma1, Gamma2, Gamma3);
+    }
     fclose(fptr);
     // */
     return 0;
